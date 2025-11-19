@@ -154,10 +154,18 @@ class SBModel(BaseModel):
         self.real_B = self.real_B[:bs_per_gpu]
         self.forward()                     # compute fake images: G(A)
         if self.opt.isTrain:
+            # Temporarily disable gradient accumulation for initialization
+            # to ensure all losses are computed normally
+            original_grad_accum = getattr(self.opt, 'use_gradient_accumulation', False)
+            self.opt.use_gradient_accumulation = False
 
             self.compute_G_loss().backward()
             self.compute_D_loss().backward()
             self.compute_E_loss().backward()
+
+            # Restore original setting
+            self.opt.use_gradient_accumulation = original_grad_accum
+
             if self.opt.lambda_NCE > 0.0 and not getattr(self.opt, 'disable_nce', False):
                 self.optimizer_F = torch.optim.Adam(self.netF.parameters(), lr=self.opt.lr, betas=(self.opt.beta1, self.opt.beta2))
                 self.optimizers.append(self.optimizer_F)
