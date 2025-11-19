@@ -211,6 +211,12 @@ class BaseModel(ABC):
                 net = getattr(self, 'net' + name)
                 if isinstance(net, torch.nn.DataParallel):
                     net = net.module
+
+                # Check if checkpoint file exists
+                if not os.path.exists(load_path):
+                    print(f'Warning: checkpoint not found at {load_path}, skipping...')
+                    continue
+
                 print('loading the model from %s' % load_path)
                 # if you are using PyTorch newer than 0.4 (e.g., built from
                 # GitHub source), you can remove str() on self.device
@@ -221,7 +227,10 @@ class BaseModel(ABC):
                 # patch InstanceNorm checkpoints prior to 0.4
                 # for key in list(state_dict.keys()):  # need to copy keys here because we mutate in loop
                 #    self.__patch_instance_norm_state_dict(state_dict, net, key.split('.'))
-                net.load_state_dict(state_dict)
+
+                # Use strict=False to allow loading checkpoints with mismatched keys
+                # This is useful when network architecture changes or for transfer learning
+                net.load_state_dict(state_dict, strict=False)
 
     def print_networks(self, verbose):
         """Print the total number of parameters in the network and (if verbose) network architecture

@@ -51,7 +51,19 @@ class SBModel(BaseModel):
 
         # specify the training losses you want to print out.
         # The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE','SB']
+        # Build loss_names dynamically based on enabled components
+        self.loss_names = ['G']  # Always have G loss
+
+        # Add GAN losses if not disabled
+        if not getattr(opt, 'disable_gan', False):
+            self.loss_names.extend(['G_GAN', 'D_real', 'D_fake'])
+
+        # Add NCE loss if not disabled
+        if not getattr(opt, 'disable_nce', False):
+            self.loss_names.append('NCE')
+
+        # Always add SB loss
+        self.loss_names.append('SB')
 
         # Add ablation study loss components
         if getattr(opt, 'use_ot_input', False):
