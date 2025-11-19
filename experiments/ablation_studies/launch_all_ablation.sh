@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # ========================================
-# Launch all 12 ablation study experiments in parallel
+# Launch all 10 ablation study experiments in parallel
 # ========================================
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 echo "========================================"
-echo "Launching All 12 Ablation Study Experiments"
+echo "Launching All 10 Ablation Study Experiments"
 echo "========================================"
 echo "Script directory: $SCRIPT_DIR"
 echo ""
@@ -37,34 +37,32 @@ submit_job() {
 }
 
 echo "=========================================="
-echo "Group 1: Fully Paired Experiments (from scratch, 100% data)"
+echo "Group A: Fully Paired (from scratch, 100% data)"
 echo "=========================================="
 echo ""
 
-submit_job "exp1_fully_pair_OT_input.sh" "Exp 1: Fully Pair - OT Input"
-submit_job "exp2_fully_pair_OT_input_E.sh" "Exp 2: Fully Pair - OT Input + Entropy"
-submit_job "exp3_fully_pair_OT_output.sh" "Exp 3: Fully Pair - OT Output"
-submit_job "exp4_fully_pair_OT_output_E.sh" "Exp 4: Fully Pair - OT Output + Entropy"
+submit_job "exp1_fully_pair_OT_output.sh" "Exp 1: OT Output"
+submit_job "exp2_fully_pair_OT_output_E.sh" "Exp 2: OT Output + Entropy"
+submit_job "exp3_fully_pair_Entropy.sh" "Exp 3: Entropy Only"
+submit_job "exp4_fully_pair_Baseline.sh" "Exp 4: Baseline (SB only)"
 
 echo "=========================================="
-echo "Group 2: Two-Stage 10% Experiments (pretrained, 10% data)"
-echo "=========================================="
-echo ""
-
-submit_job "exp5_twostage_10p_OT_input.sh" "Exp 5: Two-Stage 10% - OT Input"
-submit_job "exp6_twostage_10p_OT_input_E.sh" "Exp 6: Two-Stage 10% - OT Input + Entropy"
-submit_job "exp7_twostage_10p_OT_output.sh" "Exp 7: Two-Stage 10% - OT Output"
-submit_job "exp8_twostage_10p_OT_output_E.sh" "Exp 8: Two-Stage 10% - OT Output + Entropy"
-
-echo "=========================================="
-echo "Group 3: Two-Stage 100% Experiments (pretrained, 100% data)"
+echo "Group B: Two-Stage 10% (pretrained, 10% data)"
 echo "=========================================="
 echo ""
 
-submit_job "exp9_twostage_100p_OT_input.sh" "Exp 9: Two-Stage 100% - OT Input"
-submit_job "exp10_twostage_100p_OT_input_E.sh" "Exp 10: Two-Stage 100% - OT Input + Entropy"
-submit_job "exp11_twostage_100p_OT_output.sh" "Exp 11: Two-Stage 100% - OT Output"
-submit_job "exp12_twostage_100p_OT_output_E.sh" "Exp 12: Two-Stage 100% - OT Output + Entropy"
+submit_job "exp5_twostage_10p_OT_output.sh" "Exp 5: OT Output"
+submit_job "exp6_twostage_10p_OT_output_E.sh" "Exp 6: OT Output + Entropy"
+submit_job "exp7_twostage_10p_Entropy.sh" "Exp 7: Entropy Only"
+
+echo "=========================================="
+echo "Group C: Two-Stage 100% (pretrained, 100% data)"
+echo "=========================================="
+echo ""
+
+submit_job "exp8_twostage_100p_OT_output.sh" "Exp 8: OT Output"
+submit_job "exp9_twostage_100p_OT_output_E.sh" "Exp 9: OT Output + Entropy"
+submit_job "exp10_twostage_100p_Entropy.sh" "Exp 10: Entropy Only"
 
 echo "=========================================="
 echo "Summary"
@@ -72,12 +70,16 @@ echo "=========================================="
 echo "Total jobs submitted: ${#job_ids[@]}"
 echo "Job IDs: ${job_ids[*]}"
 echo ""
-echo "To check status of all jobs:"
-echo "  squeue -j $(IFS=,; echo "${job_ids[*]}")"
-echo ""
-echo "To cancel all jobs:"
-echo "  scancel $(IFS=' '; echo "${job_ids[*]}")"
-echo ""
+
+if [ ${#job_ids[@]} -gt 0 ]; then
+    echo "To check status of all jobs:"
+    echo "  squeue -j $(IFS=,; echo "${job_ids[*]}")"
+    echo ""
+    echo "To cancel all jobs:"
+    echo "  scancel $(IFS=' '; echo "${job_ids[*]}")"
+    echo ""
+fi
+
 echo "=========================================="
-echo "All experiments submitted successfully!"
+echo "Launch complete!"
 echo "=========================================="
