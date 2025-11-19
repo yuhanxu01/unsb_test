@@ -78,6 +78,8 @@ class TrainOptions(BaseOptions):
                             help='Only compute gradients for last N diffusion steps (-1 = all steps). Recommended: 3-5 for memory savings')
         parser.add_argument('--use_mixed_precision', action='store_true',
                             help='Use FP16 automatic mixed precision training (50% memory reduction)')
+        parser.add_argument('--use_gradient_accumulation', action='store_true',
+                            help='Separate OT_input and SB losses into sequential backward passes (lowest memory peak)')
 
         self.isTrain = True
         return parser

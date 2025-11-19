@@ -138,6 +138,8 @@ class SBModel(BaseModel):
                     print('[Memory Optimization] Gradient checkpointing enabled')
                 if getattr(opt, 'selective_gradient_steps', -1) > 0:
                     print(f'[Memory Optimization] Selective gradient: last {opt.selective_gradient_steps} steps only')
+                if getattr(opt, 'use_gradient_accumulation', False):
+                    print('[Memory Optimization] Gradient accumulation enabled (sequential backward passes)')
             
     def data_dependent_initialize(self, data,data2):
         """
@@ -161,88 +163,211 @@ class SBModel(BaseModel):
                 self.optimizers.append(self.optimizer_F)
 
     def optimize_parameters(self):
-        # Check if mixed precision is enabled
+        # Check optimization flags
         use_amp = hasattr(self, 'scaler') and self.scaler is not None
+        use_ot_input = getattr(self.opt, 'use_ot_input', False)
+        use_gradient_accumulation = getattr(self.opt, 'use_gradient_accumulation', False)
 
-        # forward
-        if use_amp:
-            with autocast():
-                self.forward()
-        else:
-            self.forward()
+        # Gradient accumulation mode: separate OT_input and SB backward passes
+        if use_ot_input and use_gradient_accumulation and self.opt.isTrain:
+            # ===== Phase 1: Compute OT_input loss with gradients =====
+            bs = self.real_A.size(0)
 
-        self.netG.train()
-
-        # Only train networks that are being used
-        use_gan = self.opt.lambda_GAN > 0.0 and not getattr(self.opt, 'disable_gan', False)
-        use_nce = self.opt.lambda_NCE > 0.0 and not getattr(self.opt, 'disable_nce', False)
-        use_entropy = getattr(self.opt, 'use_entropy_loss', False) or (
-            self.opt.lambda_SB > 0.0 and
-            not getattr(self.opt, 'use_ot_input', False) and
-            not getattr(self.opt, 'use_ot_output', False)
-        )
-
-        if use_gan:
-            self.netD.train()
-        if use_entropy:
-            self.netE.train()
-        if use_nce:
-            self.netF.train()
-
-        # update D
-        if use_gan:
-            self.set_requires_grad(self.netD, True)
-            self.optimizer_D.zero_grad()
+            # Generate noisy states with gradient
             if use_amp:
                 with autocast():
-                    self.loss_D = self.compute_D_loss()
-                self.scaler.scale(self.loss_D).backward()
-                self.scaler.step(self.optimizer_D)
-                self.scaler.update()
+                    Xt, Xt2, XtB = self.generate_noisy_state_with_grad()
             else:
-                self.loss_D = self.compute_D_loss()
-                self.loss_D.backward()
-                self.optimizer_D.step()
+                Xt, Xt2, XtB = self.generate_noisy_state_with_grad()
 
-        # update E
-        if use_entropy:
-            self.set_requires_grad(self.netE, True)
-            self.optimizer_E.zero_grad()
+            # Compute OT_input loss
+            self.optimizer_G.zero_grad()
             if use_amp:
                 with autocast():
-                    self.loss_E = self.compute_E_loss()
-                self.scaler.scale(self.loss_E).backward()
-                self.scaler.step(self.optimizer_E)
+                    self.loss_OT_input = self.opt.tau * torch.mean((Xt - self.real_B)**2)
+                self.scaler.scale(self.loss_OT_input).backward()
+            else:
+                self.loss_OT_input = self.opt.tau * torch.mean((Xt - self.real_B)**2)
+                self.loss_OT_input.backward()
+
+            # Detach for next phase
+            self.real_A_noisy = Xt.detach()
+            self.real_A_noisy2 = Xt2.detach()
+            if self.opt.nce_idt:
+                self.XtB = XtB.detach()
+
+            # ===== Phase 2: Compute remaining losses with detached states =====
+            # Now run the rest of forward pass with detached noisy states
+            z_in = torch.randn(size=[2*bs, 4*self.opt.ngf]).to(self.real_A.device)
+            z_in2 = torch.randn(size=[bs, 4*self.opt.ngf]).to(self.real_A.device)
+
+            self.real = torch.cat((self.real_A, self.real_B), dim=0) if self.opt.nce_idt and self.opt.isTrain else self.real_A
+            self.realt = torch.cat((self.real_A_noisy, self.XtB), dim=0) if self.opt.nce_idt and self.opt.isTrain else self.real_A_noisy
+
+            if self.opt.flip_equivariance:
+                self.flipped_for_equivariance = self.opt.isTrain and (np.random.random() < 0.5)
+                if self.flipped_for_equivariance:
+                    self.real = torch.flip(self.real, [3])
+                    self.realt = torch.flip(self.realt, [3])
+
+            if use_amp:
+                with autocast():
+                    self.fake = self.netG(self.realt, self.time_idx, z_in)
+                    self.fake_B2 = self.netG(self.real_A_noisy2, self.time_idx, z_in2)
+            else:
+                self.fake = self.netG(self.realt, self.time_idx, z_in)
+                self.fake_B2 = self.netG(self.real_A_noisy2, self.time_idx, z_in2)
+
+            self.fake_B = self.fake[:self.real_A.size(0)]
+            if self.opt.nce_idt:
+                self.idt_B = self.fake[self.real_A.size(0):]
+
+            # Compute and accumulate G loss (gradients accumulate on top of OT_input gradients)
+            if use_amp:
+                with autocast():
+                    self.loss_G = self.compute_G_loss()
+                self.scaler.scale(self.loss_G).backward()
+                self.scaler.step(self.optimizer_G)
                 self.scaler.update()
             else:
-                self.loss_E = self.compute_E_loss()
-                self.loss_E.backward()
-                self.optimizer_E.step()
-
-        # update G
-        if use_gan:
-            self.set_requires_grad(self.netD, False)
-        if use_entropy:
-            self.set_requires_grad(self.netE, False)
-
-        self.optimizer_G.zero_grad()
-        if use_nce and self.opt.netF == 'mlp_sample':
-            self.optimizer_F.zero_grad()
-
-        if use_amp:
-            with autocast():
                 self.loss_G = self.compute_G_loss()
-            self.scaler.scale(self.loss_G).backward()
-            self.scaler.step(self.optimizer_G)
+                self.loss_G.backward()
+                self.optimizer_G.step()
+
+            # Update other networks (D, E, F) normally
+            self.netG.train()
+            use_gan = self.opt.lambda_GAN > 0.0 and not getattr(self.opt, 'disable_gan', False)
+            use_nce = self.opt.lambda_NCE > 0.0 and not getattr(self.opt, 'disable_nce', False)
+            use_entropy = getattr(self.opt, 'use_entropy_loss', False) or (
+                self.opt.lambda_SB > 0.0 and
+                not getattr(self.opt, 'use_ot_input', False) and
+                not getattr(self.opt, 'use_ot_output', False)
+            )
+
+            if use_gan:
+                self.netD.train()
+                self.set_requires_grad(self.netD, True)
+                self.optimizer_D.zero_grad()
+                if use_amp:
+                    with autocast():
+                        self.loss_D = self.compute_D_loss()
+                    self.scaler.scale(self.loss_D).backward()
+                    self.scaler.step(self.optimizer_D)
+                    self.scaler.update()
+                else:
+                    self.loss_D = self.compute_D_loss()
+                    self.loss_D.backward()
+                    self.optimizer_D.step()
+
+            if use_entropy:
+                self.netE.train()
+                self.set_requires_grad(self.netE, True)
+                self.optimizer_E.zero_grad()
+                if use_amp:
+                    with autocast():
+                        self.loss_E = self.compute_E_loss()
+                    self.scaler.scale(self.loss_E).backward()
+                    self.scaler.step(self.optimizer_E)
+                    self.scaler.update()
+                else:
+                    self.loss_E = self.compute_E_loss()
+                    self.loss_E.backward()
+                    self.optimizer_E.step()
+
             if use_nce and self.opt.netF == 'mlp_sample':
-                self.scaler.step(self.optimizer_F)
-            self.scaler.update()
+                self.optimizer_F.zero_grad()
+                if use_amp:
+                    with autocast():
+                        loss_NCE = self.calculate_NCE_loss(self.real_A, self.fake_B)
+                    self.scaler.scale(loss_NCE).backward()
+                    self.scaler.step(self.optimizer_F)
+                    self.scaler.update()
+                else:
+                    loss_NCE = self.calculate_NCE_loss(self.real_A, self.fake_B)
+                    loss_NCE.backward()
+                    self.optimizer_F.step()
+
         else:
-            self.loss_G = self.compute_G_loss()
-            self.loss_G.backward()
-            self.optimizer_G.step()
+            # ===== Original unified backward mode =====
+            # forward
+            if use_amp:
+                with autocast():
+                    self.forward()
+            else:
+                self.forward()
+
+            self.netG.train()
+
+            # Only train networks that are being used
+            use_gan = self.opt.lambda_GAN > 0.0 and not getattr(self.opt, 'disable_gan', False)
+            use_nce = self.opt.lambda_NCE > 0.0 and not getattr(self.opt, 'disable_nce', False)
+            use_entropy = getattr(self.opt, 'use_entropy_loss', False) or (
+                self.opt.lambda_SB > 0.0 and
+                not getattr(self.opt, 'use_ot_input', False) and
+                not getattr(self.opt, 'use_ot_output', False)
+            )
+
+            if use_gan:
+                self.netD.train()
+            if use_entropy:
+                self.netE.train()
+            if use_nce:
+                self.netF.train()
+
+            # update D
+            if use_gan:
+                self.set_requires_grad(self.netD, True)
+                self.optimizer_D.zero_grad()
+                if use_amp:
+                    with autocast():
+                        self.loss_D = self.compute_D_loss()
+                    self.scaler.scale(self.loss_D).backward()
+                    self.scaler.step(self.optimizer_D)
+                    self.scaler.update()
+                else:
+                    self.loss_D = self.compute_D_loss()
+                    self.loss_D.backward()
+                    self.optimizer_D.step()
+
+            # update E
+            if use_entropy:
+                self.set_requires_grad(self.netE, True)
+                self.optimizer_E.zero_grad()
+                if use_amp:
+                    with autocast():
+                        self.loss_E = self.compute_E_loss()
+                    self.scaler.scale(self.loss_E).backward()
+                    self.scaler.step(self.optimizer_E)
+                    self.scaler.update()
+                else:
+                    self.loss_E = self.compute_E_loss()
+                    self.loss_E.backward()
+                    self.optimizer_E.step()
+
+            # update G
+            if use_gan:
+                self.set_requires_grad(self.netD, False)
+            if use_entropy:
+                self.set_requires_grad(self.netE, False)
+
+            self.optimizer_G.zero_grad()
             if use_nce and self.opt.netF == 'mlp_sample':
-                self.optimizer_F.step()       
+                self.optimizer_F.zero_grad()
+
+            if use_amp:
+                with autocast():
+                    self.loss_G = self.compute_G_loss()
+                self.scaler.scale(self.loss_G).backward()
+                self.scaler.step(self.optimizer_G)
+                if use_nce and self.opt.netF == 'mlp_sample':
+                    self.scaler.step(self.optimizer_F)
+                self.scaler.update()
+            else:
+                self.loss_G = self.compute_G_loss()
+                self.loss_G.backward()
+                self.optimizer_G.step()
+                if use_nce and self.opt.netF == 'mlp_sample':
+                    self.optimizer_F.step()       
         
     def set_input(self, input,input2=None):
         """Unpack input data from the dataloader and perform necessary pre-processing steps.
@@ -449,7 +574,97 @@ class SBModel(BaseModel):
                     Xt_1     = self.netG(Xt, time_idx, z)
                     
                     setattr(self, "fake_"+str(t+1), Xt_1)
-                    
+
+    def generate_noisy_state_with_grad(self):
+        """
+        Separate method to generate noisy states with gradients for OT_input loss.
+        Used in gradient accumulation mode to separate OT_input computation graph.
+
+        Returns:
+            Tuple of (real_A_noisy, real_A_noisy2, XtB if nce_idt else None)
+        """
+        bs = self.real_A.size(0)
+        tau = self.opt.tau
+        T = self.opt.num_timesteps
+
+        # Generate time schedule
+        incs = np.array([0] + [1/(i+1) for i in range(T-1)])
+        times = np.cumsum(incs)
+        times = times / times[-1]
+        times = 0.5 * times[-1] + 0.5 * times
+        times = np.concatenate([np.zeros(1), times])
+        times = torch.tensor(times).float().to(self.real_A.device)
+
+        # Get optimization flags
+        use_checkpoint = getattr(self.opt, 'use_gradient_checkpointing', False)
+        selective_steps = getattr(self.opt, 'selective_gradient_steps', -1)
+        total_steps = self.time_idx.int().item() + 1
+
+        if selective_steps > 0:
+            gradient_start_step = max(0, total_steps - selective_steps)
+        else:
+            gradient_start_step = 0
+
+        # Initialize states
+        Xt = self.real_A
+        Xt2 = self.real_A2
+        if self.opt.nce_idt:
+            XtB = self.real_B
+
+        # Forward diffusion with gradient
+        self.netG.train()
+
+        for t in range(total_steps):
+            if t > 0:
+                delta = times[t] - times[t-1]
+                denom = times[-1] - times[t-1]
+                inter = (delta / denom).reshape(-1, 1, 1, 1)
+                scale = (delta * (1 - delta / denom)).reshape(-1, 1, 1, 1)
+
+            use_grad_this_step = (t >= gradient_start_step)
+
+            if t > 0:
+                if use_grad_this_step:
+                    Xt = (1-inter) * Xt.detach() + inter * Xt_1 + (scale * tau).sqrt() * torch.randn_like(Xt).to(self.real_A.device)
+                    Xt2 = (1-inter) * Xt2.detach() + inter * Xt_12 + (scale * tau).sqrt() * torch.randn_like(Xt2).to(self.real_A.device)
+                    if self.opt.nce_idt:
+                        XtB = (1-inter) * XtB.detach() + inter * Xt_1B + (scale * tau).sqrt() * torch.randn_like(XtB).to(self.real_A.device)
+                else:
+                    Xt = (1-inter) * Xt.detach() + inter * Xt_1.detach() + (scale * tau).sqrt() * torch.randn_like(Xt).to(self.real_A.device)
+                    Xt2 = (1-inter) * Xt2.detach() + inter * Xt_12.detach() + (scale * tau).sqrt() * torch.randn_like(Xt2).to(self.real_A.device)
+                    if self.opt.nce_idt:
+                        XtB = (1-inter) * XtB.detach() + inter * Xt_1B.detach() + (scale * tau).sqrt() * torch.randn_like(XtB).to(self.real_A.device)
+
+            time_idx_t = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+            z = torch.randn(size=[self.real_A.shape[0], 4*self.opt.ngf]).to(self.real_A.device)
+
+            if use_checkpoint and use_grad_this_step:
+                def netG_forward(x, t_idx, z_val):
+                    return self.netG(x, t_idx, z_val)
+                Xt_1 = checkpoint(netG_forward, Xt, time_idx_t, z, use_reentrant=False)
+            else:
+                Xt_1 = self.netG(Xt, time_idx_t, z)
+
+            z2 = torch.randn(size=[self.real_A.shape[0], 4*self.opt.ngf]).to(self.real_A.device)
+            if use_checkpoint and use_grad_this_step:
+                def netG_forward2(x, t_idx, z_val):
+                    return self.netG(x, t_idx, z_val)
+                Xt_12 = checkpoint(netG_forward2, Xt2, time_idx_t, z2, use_reentrant=False)
+            else:
+                Xt_12 = self.netG(Xt2, time_idx_t, z2)
+
+            if self.opt.nce_idt:
+                zB = torch.randn(size=[self.real_A.shape[0], 4*self.opt.ngf]).to(self.real_A.device)
+                if use_checkpoint and use_grad_this_step:
+                    def netG_forwardB(x, t_idx, z_val):
+                        return self.netG(x, t_idx, z_val)
+                    Xt_1B = checkpoint(netG_forwardB, XtB, time_idx_t, zB, use_reentrant=False)
+                else:
+                    Xt_1B = self.netG(XtB, time_idx_t, zB)
+
+        # Return with gradients
+        return Xt, Xt2, XtB if self.opt.nce_idt else None
+
     def compute_D_loss(self):
         """Calculate GAN loss for the discriminator"""
         # Check if GAN is disabled
