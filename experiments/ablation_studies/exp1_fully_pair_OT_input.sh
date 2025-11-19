@@ -47,6 +47,14 @@ export USE_OT_INPUT="--use_ot_input"
 export DISABLE_GAN="--disable_gan"
 export DISABLE_NCE="--disable_nce"
 
+# Memory optimization (极致优化方案 - 推荐)
+# 使用梯度累积 + 选择性梯度 + 混合精度
+# 预期内存: 14+ GB → 1-2 GB (90-95% 减少)
+export USE_GRADIENT_ACCUMULATION="--use_gradient_accumulation"
+export SELECTIVE_GRADIENT_STEPS="--selective_gradient_steps 3"
+export USE_MIXED_PRECISION="--use_mixed_precision"
+# export USE_GRADIENT_CHECKPOINTING="--use_gradient_checkpointing"  # 可选：如果需要进一步优化
+
 # NO pre-training - train from scratch
 export CONTINUE_TRAIN=""
 export PRETRAINED_NAME=""
@@ -59,6 +67,12 @@ echo "  Output: checkpoints/$EXPERIMENT_NAME"
 echo "  Paired data: 100%"
 echo "  Loss: OT_input only"
 echo "  Epochs: 1-400 (constant LR) + 401-600 (decay)"
+echo ""
+echo "Memory Optimizations:"
+echo "  Gradient Accumulation: ENABLED (lowest memory peak)"
+echo "  Selective Gradient: Last 3 steps only"
+echo "  Mixed Precision: FP16 enabled"
+echo "  Expected Memory: 1-2 GB (vs 14+ GB without optimization)"
 echo ""
 
 # Run training

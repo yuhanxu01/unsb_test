@@ -48,6 +48,14 @@ export USE_ENTROPY="--use_entropy_loss"
 export DISABLE_GAN="--disable_gan"
 export DISABLE_NCE="--disable_nce"
 
+# Memory optimization (极致优化方案 - 推荐)
+# 使用梯度累积 + 选择性梯度 + 混合精度
+# 预期内存: 14+ GB → 1-2 GB (90-95% 减少)
+export USE_GRADIENT_ACCUMULATION="--use_gradient_accumulation"
+export SELECTIVE_GRADIENT_STEPS="--selective_gradient_steps 3"
+export USE_MIXED_PRECISION="--use_mixed_precision"
+# export USE_GRADIENT_CHECKPOINTING="--use_gradient_checkpointing"  # 可选：如果需要进一步优化
+
 # Load from pre-trained unpaired model
 export CONTINUE_TRAIN="--continue_train"
 export PRETRAINED_NAME="unpaired"

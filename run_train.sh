@@ -36,6 +36,12 @@ USE_ENTROPY=${USE_ENTROPY:-""}  # Set to "--use_entropy_loss" to enable
 DISABLE_GAN=${DISABLE_GAN:-""}  # Set to "--disable_gan" to disable GAN loss
 DISABLE_NCE=${DISABLE_NCE:-""}  # Set to "--disable_nce" to disable NCE loss
 
+# Memory optimization options (for OT_input experiments)
+USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING:-""}  # Set to "--use_gradient_checkpointing" to enable
+SELECTIVE_GRADIENT_STEPS=${SELECTIVE_GRADIENT_STEPS:-""}  # Set to "--selective_gradient_steps N" to enable (e.g., "3")
+USE_MIXED_PRECISION=${USE_MIXED_PRECISION:-""}  # Set to "--use_mixed_precision" to enable
+USE_GRADIENT_ACCUMULATION=${USE_GRADIENT_ACCUMULATION:-""}  # Set to "--use_gradient_accumulation" to enable
+
 # Resume training
 CONTINUE_TRAIN=${CONTINUE_TRAIN:-""}  # Set to "--continue_train" to enable
 PRETRAINED_NAME=${PRETRAINED_NAME:-""}
@@ -90,7 +96,11 @@ CMD="$PYTHON_BIN train.py \
   $USE_OT_OUTPUT \
   $USE_ENTROPY \
   $DISABLE_GAN \
-  $DISABLE_NCE"
+  $DISABLE_NCE \
+  $USE_GRADIENT_CHECKPOINTING \
+  $SELECTIVE_GRADIENT_STEPS \
+  $USE_MIXED_PRECISION \
+  $USE_GRADIENT_ACCUMULATION"
 
 # Add pretrained model if specified
 if [ -n "$PRETRAINED_NAME" ]; then
