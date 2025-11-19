@@ -715,11 +715,11 @@ class SBModel(BaseModel):
     def compute_G_loss(self):
         bs =  self.real_A.size(0)
         tau = self.opt.tau
-        
+
         """Calculate GAN and NCE loss for the generator"""
         fake = self.fake_B
         std = torch.rand(size=[1]).item() * self.opt.std
-        
+
         # GAN loss (can be disabled for ablation studies)
         if self.opt.lambda_GAN > 0.0 and not getattr(self.opt, 'disable_gan', False):
             pred_fake = self.netD(fake,self.time_idx)
@@ -730,13 +730,21 @@ class SBModel(BaseModel):
         # Schrödinger Bridge loss with modular components
         self.loss_SB = torch.tensor(0.0, device=self.real_A.device)
         self.loss_SB_guidance = torch.tensor(0.0, device=self.real_A.device)  # For scheme A
-        self.loss_OT_input = torch.tensor(0.0, device=self.real_A.device)     # For ablation: real_A_noisy -> real_B (supervise intermediate state)
+
+        # Check if we're in gradient accumulation mode
+        use_gradient_accumulation = getattr(self.opt, 'use_gradient_accumulation', False)
+        use_ot_input = getattr(self.opt, 'use_ot_input', False)
+
+        # Initialize OT losses
+        # In gradient accumulation mode, OT_input is computed separately, so don't include it here
+        if not (use_gradient_accumulation and use_ot_input and self.opt.isTrain):
+            self.loss_OT_input = torch.tensor(0.0, device=self.real_A.device)     # For ablation: real_A_noisy -> real_B (supervise intermediate state)
+        # OT_output is always computed here
         self.loss_OT_output = torch.tensor(0.0, device=self.real_A.device)    # For ablation: fake_B -> real_B (supervise final output)
         self.loss_entropy = torch.tensor(0.0, device=self.real_A.device)      # For ablation: ET_XY term (energy regularization)
 
         if self.opt.lambda_SB > 0.0:
             # Check if using new ablation study parameters
-            use_ot_input = getattr(self.opt, 'use_ot_input', False)
             use_ot_output = getattr(self.opt, 'use_ot_output', False)
             use_entropy_loss = getattr(self.opt, 'use_entropy_loss', False)
 
@@ -750,7 +758,9 @@ class SBModel(BaseModel):
                     self.loss_entropy = -(self.opt.num_timesteps-self.time_idx[0])/self.opt.num_timesteps*self.opt.tau*ET_XY
                     self.loss_SB += self.loss_entropy
 
-                if use_ot_input:
+                # Only compute OT_input here if NOT in gradient accumulation mode
+                # In gradient accumulation mode, it's computed separately in optimize_parameters
+                if use_ot_input and not (use_gradient_accumulation and self.opt.isTrain):
                     # OT input loss: directly constrain noisy state to GT
                     # real_A_noisy is computed with gradient in forward() when use_ot_input=True
                     # This supervises the intermediate diffusion state directly
