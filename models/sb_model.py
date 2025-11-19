@@ -28,7 +28,17 @@ class SBModel(BaseModel):
         parser.add_argument('--flip_equivariance',
                             type=util.str2bool, nargs='?', const=True, default=False,
                             help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT")
-        
+
+        # L2 intermediate loss arguments
+        parser.add_argument('--use_l2_intermediate_single', type=util.str2bool, nargs='?', const=True, default=False,
+                            help='Use L2 loss on single intermediate step: MSE(netG(X_{i-1}), real_B)')
+        parser.add_argument('--use_l2_intermediate_multi', type=util.str2bool, nargs='?', const=True, default=False,
+                            help='Use L2 loss on multiple intermediate steps: sum of MSE(netG(X_i), real_B) for all i')
+        parser.add_argument('--intermediate_step', type=int, default=-1,
+                            help='Which intermediate step to supervise (default: T//2). Only used with use_l2_intermediate_single')
+        parser.add_argument('--intermediate_weight', type=float, default=1.0,
+                            help='Weight for L2 intermediate loss')
+
         parser.set_defaults(pool_size=0)  # no image pooling
 
         opt, _ = parser.parse_known_args()
@@ -72,6 +82,12 @@ class SBModel(BaseModel):
             self.loss_names.append('OT_output')
         if getattr(opt, 'use_entropy_loss', False):
             self.loss_names.append('entropy')
+
+        # Add L2 intermediate loss components
+        if getattr(opt, 'use_l2_intermediate_single', False):
+            self.loss_names.append('L2_inter_single')
+        if getattr(opt, 'use_l2_intermediate_multi', False):
+            self.loss_names.append('L2_inter_multi')
 
         # Add strategy-specific losses
         paired_strategy = getattr(opt, 'paired_strategy', 'none')
@@ -239,10 +255,33 @@ class SBModel(BaseModel):
         self.time_idx = time_idx
         self.timestep     = times[time_idx]
 
-        # Forward diffusion to generate noisy states (always no_grad)
-        # OT_input experiments removed from ablation study (caused gradient issues)
-        with torch.no_grad():
-            self.netG.eval()
+        # Check if we need L2 intermediate loss
+        use_l2_inter_single = getattr(self.opt, 'use_l2_intermediate_single', False) and self.opt.isTrain
+        use_l2_inter_multi = getattr(self.opt, 'use_l2_intermediate_multi', False) and self.opt.isTrain
+        use_l2_intermediate = use_l2_inter_single or use_l2_inter_multi
+
+        # Determine which steps need gradient
+        target_step = self.time_idx.int().item()
+        if use_l2_inter_single:
+            # Single step: use specified step or T//2
+            intermediate_step = self.opt.intermediate_step if self.opt.intermediate_step >= 0 else T // 2
+            intermediate_step = min(intermediate_step, target_step)  # Don't exceed current time_idx
+            intermediate_steps = [intermediate_step]
+        elif use_l2_inter_multi:
+            # Multi-step: all steps from 1 to target_step
+            intermediate_steps = list(range(1, target_step + 1))
+        else:
+            intermediate_steps = []
+
+        # Store intermediate predictions (with gradient)
+        self.intermediate_preds = []
+        self.intermediate_time_indices = []
+
+        # Forward diffusion to generate noisy states
+        # Use gradient only for intermediate steps when L2 intermediate loss is enabled
+        if use_l2_intermediate:
+            # Need gradient for intermediate steps
+            self.netG.train()  # Keep in train mode for gradient
             for t in range(self.time_idx.int().item()+1):
 
                 if t > 0:
@@ -251,28 +290,72 @@ class SBModel(BaseModel):
                     inter = (delta / denom).reshape(-1,1,1,1)
                     scale = (delta * (1 - delta / denom)).reshape(-1,1,1,1)
                 Xt       = self.real_A if (t == 0) else (1-inter) * Xt + inter * Xt_1.detach() + (scale * tau).sqrt() * torch.randn_like(Xt).to(self.real_A.device)
-                time_idx = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
-                time     = times[time_idx]
+                time_idx_t = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+                time     = times[time_idx_t]
                 z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
-                Xt_1     = self.netG(Xt, time_idx, z)
 
-                Xt2       = self.real_A2 if (t == 0) else (1-inter) * Xt2 + inter * Xt_12.detach() + (scale * tau).sqrt() * torch.randn_like(Xt2).to(self.real_A.device)
-                time_idx = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
-                time     = times[time_idx]
-                z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
-                Xt_12    = self.netG(Xt2, time_idx, z)
+                # Compute network output (with or without grad depending on whether this is an intermediate step)
+                if t in intermediate_steps:
+                    # Keep gradient for intermediate supervision
+                    Xt_1 = self.netG(Xt, time_idx_t, z)
+                    self.intermediate_preds.append(Xt_1)
+                    self.intermediate_time_indices.append(time_idx_t)
+                else:
+                    # No gradient needed
+                    with torch.no_grad():
+                        Xt_1 = self.netG(Xt, time_idx_t, z)
 
+                # For the second sample (always no_grad)
+                with torch.no_grad():
+                    Xt2       = self.real_A2 if (t == 0) else (1-inter) * Xt2 + inter * Xt_12.detach() + (scale * tau).sqrt() * torch.randn_like(Xt2).to(self.real_A.device)
+                    z2        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                    Xt_12    = self.netG(Xt2, time_idx_t, z2)
 
+                # For NCE identity (always no_grad)
                 if self.opt.nce_idt:
-                    XtB = self.real_B if (t == 0) else (1-inter) * XtB + inter * Xt_1B.detach() + (scale * tau).sqrt() * torch.randn_like(XtB).to(self.real_A.device)
-                    time_idx = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
-                    time     = times[time_idx]
-                    z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
-                    Xt_1B = self.netG(XtB, time_idx, z)
+                    with torch.no_grad():
+                        XtB = self.real_B if (t == 0) else (1-inter) * XtB + inter * Xt_1B.detach() + (scale * tau).sqrt() * torch.randn_like(XtB).to(self.real_A.device)
+                        zB        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                        Xt_1B = self.netG(XtB, time_idx_t, zB)
+
             if self.opt.nce_idt:
                 self.XtB = XtB.detach()
             self.real_A_noisy = Xt.detach()
             self.real_A_noisy2 = Xt2.detach()
+
+        else:
+            # Original behavior: all no_grad
+            with torch.no_grad():
+                self.netG.eval()
+                for t in range(self.time_idx.int().item()+1):
+
+                    if t > 0:
+                        delta = times[t] - times[t-1]
+                        denom = times[-1] - times[t-1]
+                        inter = (delta / denom).reshape(-1,1,1,1)
+                        scale = (delta * (1 - delta / denom)).reshape(-1,1,1,1)
+                    Xt       = self.real_A if (t == 0) else (1-inter) * Xt + inter * Xt_1.detach() + (scale * tau).sqrt() * torch.randn_like(Xt).to(self.real_A.device)
+                    time_idx_t = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+                    time     = times[time_idx_t]
+                    z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                    Xt_1     = self.netG(Xt, time_idx_t, z)
+
+                    Xt2       = self.real_A2 if (t == 0) else (1-inter) * Xt2 + inter * Xt_12.detach() + (scale * tau).sqrt() * torch.randn_like(Xt2).to(self.real_A.device)
+                    time_idx_t = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+                    time     = times[time_idx_t]
+                    z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                    Xt_12    = self.netG(Xt2, time_idx_t, z)
+
+                    if self.opt.nce_idt:
+                        XtB = self.real_B if (t == 0) else (1-inter) * XtB + inter * Xt_1B.detach() + (scale * tau).sqrt() * torch.randn_like(XtB).to(self.real_A.device)
+                        time_idx_t = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+                        time     = times[time_idx_t]
+                        z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                        Xt_1B = self.netG(XtB, time_idx_t, z)
+                if self.opt.nce_idt:
+                    self.XtB = XtB.detach()
+                self.real_A_noisy = Xt.detach()
+                self.real_A_noisy2 = Xt2.detach()
                       
         
         z_in    = torch.randn(size=[2*bs,4*self.opt.ngf]).to(self.real_A.device)
@@ -394,6 +477,8 @@ class SBModel(BaseModel):
         self.loss_OT_input = torch.tensor(0.0, device=self.real_A.device)     # For ablation: real_A_noisy -> real_B (supervise intermediate state)
         self.loss_OT_output = torch.tensor(0.0, device=self.real_A.device)    # For ablation: fake_B -> real_B (supervise final output)
         self.loss_entropy = torch.tensor(0.0, device=self.real_A.device)      # For ablation: ET_XY term (energy regularization)
+        self.loss_L2_inter_single = torch.tensor(0.0, device=self.real_A.device)  # For L2 intermediate loss (single step)
+        self.loss_L2_inter_multi = torch.tensor(0.0, device=self.real_A.device)   # For L2 intermediate loss (multi-step)
 
         if self.opt.lambda_SB > 0.0:
             # Check if using new ablation study parameters
@@ -433,6 +518,27 @@ class SBModel(BaseModel):
                     # This guides fake_B toward real_B while maintaining SB's mathematical structure
                     self.loss_SB_guidance = self.opt.tau * torch.mean((self.fake_B - self.real_B)**2)
                     self.loss_SB += self.loss_SB_guidance
+
+        # L2 Intermediate Loss: supervise intermediate network outputs
+        if getattr(self.opt, 'use_l2_intermediate_single', False):
+            # Single-step intermediate supervision
+            if len(self.intermediate_preds) > 0:
+                # Use the stored intermediate prediction
+                intermediate_weight = getattr(self.opt, 'intermediate_weight', 1.0)
+                self.loss_L2_inter_single = intermediate_weight * self.opt.tau * torch.mean((self.intermediate_preds[0] - self.real_B)**2)
+                self.loss_SB += self.loss_L2_inter_single
+
+        if getattr(self.opt, 'use_l2_intermediate_multi', False):
+            # Multi-step intermediate supervision
+            if len(self.intermediate_preds) > 0:
+                intermediate_weight = getattr(self.opt, 'intermediate_weight', 1.0)
+                # Average loss over all intermediate steps
+                total_inter_loss = torch.tensor(0.0, device=self.real_A.device)
+                for inter_pred in self.intermediate_preds:
+                    total_inter_loss += torch.mean((inter_pred - self.real_B)**2)
+                self.loss_L2_inter_multi = intermediate_weight * self.opt.tau * total_inter_loss / len(self.intermediate_preds)
+                self.loss_SB += self.loss_L2_inter_multi
+
         # NCE loss (can be disabled for ablation studies)
         if self.opt.lambda_NCE > 0.0 and not getattr(self.opt, 'disable_nce', False):
             self.loss_NCE = self.calculate_NCE_loss(self.real_A, fake)

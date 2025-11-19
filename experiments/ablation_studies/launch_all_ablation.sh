@@ -7,7 +7,7 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 echo "========================================"
-echo "Launching All 10 Ablation Study Experiments"
+echo "Launching All 16 Ablation Study Experiments"
 echo "========================================"
 echo "Script directory: $SCRIPT_DIR"
 echo ""
@@ -63,6 +63,24 @@ echo ""
 submit_job "exp8_twostage_100p_OT_output.sh" "Exp 8: OT Output"
 submit_job "exp9_twostage_100p_OT_output_E.sh" "Exp 9: OT Output + Entropy"
 submit_job "exp10_twostage_100p_Entropy.sh" "Exp 10: Entropy Only"
+
+echo "=========================================="
+echo "Group D: L2 Intermediate Single-Step (fully paired)"
+echo "=========================================="
+echo ""
+
+submit_job "exp11_fully_pair_L2_inter_single.sh" "Exp 11: L2 Inter Single"
+submit_job "exp12_fully_pair_L2_inter_single_E.sh" "Exp 12: L2 Inter Single + Entropy"
+submit_job "exp13_fully_pair_L2_inter_single_OT_output.sh" "Exp 13: L2 Inter Single + OT Output"
+submit_job "exp14_fully_pair_L2_inter_single_OT_output_E.sh" "Exp 14: L2 Inter Single + OT Output + Entropy"
+
+echo "=========================================="
+echo "Group E: L2 Intermediate Multi-Step (fully paired)"
+echo "=========================================="
+echo ""
+
+submit_job "exp15_fully_pair_L2_inter_multi.sh" "Exp 15: L2 Inter Multi"
+submit_job "exp16_fully_pair_L2_inter_multi_E.sh" "Exp 16: L2 Inter Multi + Entropy"
 
 echo "=========================================="
 echo "Summary"
