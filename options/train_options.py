@@ -71,5 +71,13 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--disable_gan', action='store_true', help='Disable GAN adversarial loss')
         parser.add_argument('--disable_nce', action='store_true', help='Disable NCE contrastive loss')
 
+        # Memory optimization options for OT_input experiments
+        parser.add_argument('--use_gradient_checkpointing', action='store_true',
+                            help='Use gradient checkpointing to reduce memory (50-70% reduction, 20-30% slower)')
+        parser.add_argument('--selective_gradient_steps', type=int, default=-1,
+                            help='Only compute gradients for last N diffusion steps (-1 = all steps). Recommended: 3-5 for memory savings')
+        parser.add_argument('--use_mixed_precision', action='store_true',
+                            help='Use FP16 automatic mixed precision training (50% memory reduction)')
+
         self.isTrain = True
         return parser
