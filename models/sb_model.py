@@ -1,0 +1,722 @@
+import numpy as np
+import torch
+from .base_model import BaseModel
+from . import networks
+from .patchnce import PatchNCELoss
+import util.util as util
+
+class SBModel(BaseModel):
+    @staticmethod
+    def modify_commandline_options(parser, is_train=True):
+        """  Configures options specific for SB model
+        """
+        parser.add_argument('--mode', type=str, default="sb", choices='(FastCUT, fastcut, sb)')
+
+        parser.add_argument('--lambda_GAN', type=float, default=1.0, help='weight for GAN loss：GAN(G(X))')
+        parser.add_argument('--lambda_NCE', type=float, default=1.0, help='weight for NCE loss: NCE(G(X), X)')
+        parser.add_argument('--lambda_SB', type=float, default=0.1, help='weight for SB loss')
+        parser.add_argument('--nce_idt', type=util.str2bool, nargs='?', const=True, default=False, help='use NCE loss for identity mapping: NCE(G(Y), Y))')
+        parser.add_argument('--nce_layers', type=str, default='0,4,8,12,16', help='compute NCE loss on which layers')
+        parser.add_argument('--nce_includes_all_negatives_from_minibatch',
+                            type=util.str2bool, nargs='?', const=True, default=False,
+                            help='(used for single image translation) If True, include the negatives from the other samples of the minibatch when computing the contrastive loss. Please see models/patchnce.py for more details.')
+        parser.add_argument('--netF', type=str, default='mlp_sample', choices=['sample', 'reshape', 'mlp_sample'], help='how to downsample the feature map')
+        parser.add_argument('--netF_nc', type=int, default=256)
+        parser.add_argument('--nce_T', type=float, default=0.07, help='temperature for NCE loss')
+        parser.add_argument('--lmda', type=float, default=0.1)
+        parser.add_argument('--num_patches', type=int, default=256, help='number of patches per layer')
+        parser.add_argument('--flip_equivariance',
+                            type=util.str2bool, nargs='?', const=True, default=False,
+                            help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT")
+        
+        parser.set_defaults(pool_size=0)  # no image pooling
+
+        opt, _ = parser.parse_known_args()
+
+        # Set default parameters for CUT and FastCUT
+        if opt.mode.lower() == "sb":
+            parser.set_defaults(nce_idt=True, lambda_NCE=1.0)
+        elif opt.mode.lower() == "fastcut":
+            parser.set_defaults(
+                nce_idt=False, lambda_NCE=10.0, flip_equivariance=True,
+                n_epochs=150, n_epochs_decay=50
+            )
+        else:
+            raise ValueError(opt.mode)
+
+        return parser
+
+    def __init__(self, opt):
+        BaseModel.__init__(self, opt)
+
+        # specify the training losses you want to print out.
+        # The training/test scripts will call <BaseModel.get_current_losses>
+        self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE','SB']
+
+        # Add ablation study loss components
+        if getattr(opt, 'use_ot_input', False):
+            self.loss_names.append('OT_input')
+        if getattr(opt, 'use_ot_output', False):
+            self.loss_names.append('OT_output')
+        if getattr(opt, 'use_entropy_loss', False):
+            self.loss_names.append('entropy')
+
+        # Add strategy-specific losses
+        paired_strategy = getattr(opt, 'paired_strategy', 'none')
+        if getattr(opt, 'paired_stage', False):
+            if paired_strategy == 'sb_gt_transport':
+                self.loss_names.append('SB_guidance')  # Scheme A
+            elif paired_strategy == 'l1_loss':
+                self.loss_names.append('L1')  # Baseline
+            elif paired_strategy == 'nce_feature':
+                self.loss_names.append('NCE_paired')  # B1
+            elif paired_strategy == 'frequency':
+                self.loss_names.append('freq')  # B2
+            elif paired_strategy == 'gradient':
+                self.loss_names.append('gradient')  # B3
+            elif paired_strategy == 'multiscale':
+                self.loss_names.append('multiscale')  # B4
+            elif paired_strategy == 'selfsup_contrast':
+                self.loss_names.append('contrast')  # B5
+
+        self.visual_names = ['real_A','real_A_noisy', 'fake_B', 'real_B']
+        if self.opt.phase == 'test':
+            self.visual_names = ['real']
+            for NFE in range(self.opt.num_timesteps):
+                fake_name = 'fake_' + str(NFE+1)
+                self.visual_names.append(fake_name)
+        self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
+
+        if opt.nce_idt and self.isTrain:
+            self.loss_names += ['NCE_Y']
+            self.visual_names += ['idt_B']
+
+        if self.isTrain:
+            self.model_names = ['G', 'F', 'D','E']
+        else:  # during test time, only load G
+            self.model_names = ['G']
+
+        # define networks (both generator and discriminator)
+        self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, opt.no_antialias_up, self.gpu_ids, opt)
+        self.netF = networks.define_F(opt.input_nc, opt.netF, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
+
+        if self.isTrain:
+            self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
+            # netE takes concatenated pairs [Xt, G(Xt)] and [Xt2, G(Xt2)] before the first layer
+            # so its effective input channels are 2 * (input_nc + output_nc)
+            e_in_nc = 2 * (opt.input_nc + opt.output_nc)
+            self.netE = networks.define_D(e_in_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD,
+                                          opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
+            # define loss functions
+            self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
+            self.criterionNCE = []
+
+            for nce_layer in self.nce_layers:
+                self.criterionNCE.append(PatchNCELoss(opt).to(self.device))
+
+            self.criterionIdt = torch.nn.L1Loss().to(self.device)
+            self.criterionL1 = torch.nn.L1Loss().to(self.device)
+            self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+            self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+            self.optimizer_E = torch.optim.Adam(self.netE.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+            self.optimizers.append(self.optimizer_G)
+            self.optimizers.append(self.optimizer_D)
+            self.optimizers.append(self.optimizer_E)
+            
+    def data_dependent_initialize(self, data,data2):
+        """
+        The feature network netF is defined in terms of the shape of the intermediate, extracted
+        features of the encoder portion of netG. Because of this, the weights of netF are
+        initialized at the first feedforward pass with some input images.
+        Please also see PatchSampleF.create_mlp(), which is called at the first forward() call.
+        """
+        bs_per_gpu = data["A"].size(0) // max(len(self.opt.gpu_ids), 1)
+        self.set_input(data,data2)
+        self.real_A = self.real_A[:bs_per_gpu]
+        self.real_B = self.real_B[:bs_per_gpu]
+        self.forward()                     # compute fake images: G(A)
+        if self.opt.isTrain:
+
+            self.compute_G_loss().backward()
+            self.compute_D_loss().backward()
+            self.compute_E_loss().backward()
+            if self.opt.lambda_NCE > 0.0 and not getattr(self.opt, 'disable_nce', False):
+                self.optimizer_F = torch.optim.Adam(self.netF.parameters(), lr=self.opt.lr, betas=(self.opt.beta1, self.opt.beta2))
+                self.optimizers.append(self.optimizer_F)
+
+    def optimize_parameters(self):
+        # forward
+        self.forward()
+        self.netG.train()
+
+        # Only train networks that are being used
+        use_gan = self.opt.lambda_GAN > 0.0 and not getattr(self.opt, 'disable_gan', False)
+        use_nce = self.opt.lambda_NCE > 0.0 and not getattr(self.opt, 'disable_nce', False)
+        use_entropy = getattr(self.opt, 'use_entropy_loss', False) or (
+            self.opt.lambda_SB > 0.0 and
+            not getattr(self.opt, 'use_ot_input', False) and
+            not getattr(self.opt, 'use_ot_output', False)
+        )
+
+        if use_gan:
+            self.netD.train()
+        if use_entropy:
+            self.netE.train()
+        if use_nce:
+            self.netF.train()
+
+        # update D
+        if use_gan:
+            self.set_requires_grad(self.netD, True)
+            self.optimizer_D.zero_grad()
+            self.loss_D = self.compute_D_loss()
+            self.loss_D.backward()
+            self.optimizer_D.step()
+
+        # update E
+        if use_entropy:
+            self.set_requires_grad(self.netE, True)
+            self.optimizer_E.zero_grad()
+            self.loss_E = self.compute_E_loss()
+            self.loss_E.backward()
+            self.optimizer_E.step()
+        
+        # update G
+        if use_gan:
+            self.set_requires_grad(self.netD, False)
+        if use_entropy:
+            self.set_requires_grad(self.netE, False)
+
+        self.optimizer_G.zero_grad()
+        if use_nce and self.opt.netF == 'mlp_sample':
+            self.optimizer_F.zero_grad()
+        self.loss_G = self.compute_G_loss()
+        self.loss_G.backward()
+        self.optimizer_G.step()
+        if use_nce and self.opt.netF == 'mlp_sample':
+            self.optimizer_F.step()       
+        
+    def set_input(self, input,input2=None):
+        """Unpack input data from the dataloader and perform necessary pre-processing steps.
+        Parameters:
+            input (dict): include the data itself and its metadata information.
+        The option 'direction' can be used to swap domain A and domain B.
+        """
+        AtoB = self.opt.direction == 'AtoB'
+        self.real_A = input['A' if AtoB else 'B'].to(self.device)
+        self.real_B = input['B' if AtoB else 'A'].to(self.device)
+        if input2 is not None:
+            self.real_A2 = input2['A' if AtoB else 'B'].to(self.device)
+            self.real_B2 = input2['B' if AtoB else 'A'].to(self.device)
+
+        self.image_paths = input['A_paths' if AtoB else 'B_paths']
+
+    def forward(self):
+
+        tau = self.opt.tau
+        T = self.opt.num_timesteps
+        incs = np.array([0] + [1/(i+1) for i in range(T-1)])
+        times = np.cumsum(incs)
+        times = times / times[-1]
+        times = 0.5 * times[-1] + 0.5 * times
+        times = np.concatenate([np.zeros(1),times])
+        times = torch.tensor(times).float().cuda()
+        self.times = times
+        bs =  self.real_A.size(0)
+        time_idx = (torch.randint(T, size=[1]).cuda() * torch.ones(size=[1]).cuda()).long()
+        self.time_idx = time_idx
+        self.timestep     = times[time_idx]
+
+        # Check if we need gradient for real_A_noisy (for OT_input experiments)
+        use_ot_input = getattr(self.opt, 'use_ot_input', False)
+        compute_noisy_with_grad = use_ot_input and self.opt.isTrain
+
+        # Forward diffusion to generate noisy states
+        # Use gradient-enabled version only for OT_input experiments
+        if compute_noisy_with_grad:
+            # Gradient-enabled version (for OT_input loss)
+            # This allows (real_A_noisy - real_B)^2 to have gradient
+            self.netG.train()  # Keep in train mode to preserve gradients
+
+            Xt = self.real_A
+            Xt2 = self.real_A2
+            if self.opt.nce_idt:
+                XtB = self.real_B
+
+            for t in range(self.time_idx.int().item()+1):
+                if t > 0:
+                    delta = times[t] - times[t-1]
+                    denom = times[-1] - times[t-1]
+                    inter = (delta / denom).reshape(-1,1,1,1)
+                    scale = (delta * (1 - delta / denom)).reshape(-1,1,1,1)
+
+                if t > 0:
+                    # Don't detach - keep gradients!
+                    # Use stop_gradient on previous state to save memory
+                    Xt = (1-inter) * Xt.detach() + inter * Xt_1 + (scale * tau).sqrt() * torch.randn_like(Xt).to(self.real_A.device)
+                    Xt2 = (1-inter) * Xt2.detach() + inter * Xt_12 + (scale * tau).sqrt() * torch.randn_like(Xt2).to(self.real_A.device)
+                    if self.opt.nce_idt:
+                        XtB = (1-inter) * XtB.detach() + inter * Xt_1B + (scale * tau).sqrt() * torch.randn_like(XtB).to(self.real_A.device)
+
+                time_idx_t = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+                z = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+
+                Xt_1 = self.netG(Xt, time_idx_t, z)
+
+                z2 = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                Xt_12 = self.netG(Xt2, time_idx_t, z2)
+
+                if self.opt.nce_idt:
+                    zB = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                    Xt_1B = self.netG(XtB, time_idx_t, zB)
+
+            # Keep gradient for OT_input loss
+            self.real_A_noisy = Xt
+            self.real_A_noisy2 = Xt2
+            if self.opt.nce_idt:
+                self.XtB = XtB
+        else:
+            # Original no_grad version (for OT_output and entropy experiments)
+            with torch.no_grad():
+                self.netG.eval()
+                for t in range(self.time_idx.int().item()+1):
+
+                    if t > 0:
+                        delta = times[t] - times[t-1]
+                        denom = times[-1] - times[t-1]
+                        inter = (delta / denom).reshape(-1,1,1,1)
+                        scale = (delta * (1 - delta / denom)).reshape(-1,1,1,1)
+                    Xt       = self.real_A if (t == 0) else (1-inter) * Xt + inter * Xt_1.detach() + (scale * tau).sqrt() * torch.randn_like(Xt).to(self.real_A.device)
+                    time_idx = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+                    time     = times[time_idx]
+                    z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                    Xt_1     = self.netG(Xt, time_idx, z)
+
+                    Xt2       = self.real_A2 if (t == 0) else (1-inter) * Xt2 + inter * Xt_12.detach() + (scale * tau).sqrt() * torch.randn_like(Xt2).to(self.real_A.device)
+                    time_idx = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+                    time     = times[time_idx]
+                    z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                    Xt_12    = self.netG(Xt2, time_idx, z)
+
+
+                    if self.opt.nce_idt:
+                        XtB = self.real_B if (t == 0) else (1-inter) * XtB + inter * Xt_1B.detach() + (scale * tau).sqrt() * torch.randn_like(XtB).to(self.real_A.device)
+                        time_idx = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+                        time     = times[time_idx]
+                        z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                        Xt_1B = self.netG(XtB, time_idx, z)
+                if self.opt.nce_idt:
+                    self.XtB = XtB.detach()
+                self.real_A_noisy = Xt.detach()
+                self.real_A_noisy2 = Xt2.detach()
+                      
+        
+        z_in    = torch.randn(size=[2*bs,4*self.opt.ngf]).to(self.real_A.device)
+        z_in2    = torch.randn(size=[bs,4*self.opt.ngf]).to(self.real_A.device)
+        """Run forward pass"""
+        self.real = torch.cat((self.real_A, self.real_B), dim=0) if self.opt.nce_idt and self.opt.isTrain else self.real_A
+        
+        self.realt = torch.cat((self.real_A_noisy, self.XtB), dim=0) if self.opt.nce_idt and self.opt.isTrain else self.real_A_noisy
+        
+        if self.opt.flip_equivariance:
+            self.flipped_for_equivariance = self.opt.isTrain and (np.random.random() < 0.5)
+            if self.flipped_for_equivariance:
+                self.real = torch.flip(self.real, [3])
+                self.realt = torch.flip(self.realt, [3])
+        
+        self.fake = self.netG(self.realt,self.time_idx,z_in)
+        self.fake_B2 =  self.netG(self.real_A_noisy2,self.time_idx,z_in2)
+        self.fake_B = self.fake[:self.real_A.size(0)]
+        if self.opt.nce_idt:
+            self.idt_B = self.fake[self.real_A.size(0):]
+            
+        if self.opt.phase == 'test':
+            tau = self.opt.tau
+            T = self.opt.num_timesteps
+            incs = np.array([0] + [1/(i+1) for i in range(T-1)])
+            times = np.cumsum(incs)
+            times = times / times[-1]
+            times = 0.5 * times[-1] + 0.5 * times
+            times = np.concatenate([np.zeros(1),times])
+            times = torch.tensor(times).float().cuda()
+            self.times = times
+            bs =  self.real.size(0)
+            time_idx = (torch.randint(T, size=[1]).cuda() * torch.ones(size=[1]).cuda()).long()
+            self.time_idx = time_idx
+            self.timestep     = times[time_idx]
+            visuals = []
+            with torch.no_grad():
+                self.netG.eval()
+                for t in range(self.opt.num_timesteps):
+                    
+                    if t > 0:
+                        delta = times[t] - times[t-1]
+                        denom = times[-1] - times[t-1]
+                        inter = (delta / denom).reshape(-1,1,1,1)
+                        scale = (delta * (1 - delta / denom)).reshape(-1,1,1,1)
+                    Xt       = self.real_A if (t == 0) else (1-inter) * Xt + inter * Xt_1.detach() + (scale * tau).sqrt() * torch.randn_like(Xt).to(self.real_A.device)
+                    time_idx = (t * torch.ones(size=[self.real_A.shape[0]]).to(self.real_A.device)).long()
+                    time     = times[time_idx]
+                    z        = torch.randn(size=[self.real_A.shape[0],4*self.opt.ngf]).to(self.real_A.device)
+                    Xt_1     = self.netG(Xt, time_idx, z)
+                    
+                    setattr(self, "fake_"+str(t+1), Xt_1)
+                    
+    def compute_D_loss(self):
+        """Calculate GAN loss for the discriminator"""
+        # Check if GAN is disabled
+        if getattr(self.opt, 'disable_gan', False):
+            self.loss_D = torch.tensor(0.0, device=self.real_A.device, requires_grad=True)
+            return self.loss_D
+
+        bs =  self.real_A.size(0)
+
+        fake = self.fake_B.detach()
+        std = torch.rand(size=[1]).item() * self.opt.std
+
+        pred_fake = self.netD(fake,self.time_idx)
+        self.loss_D_fake = self.criterionGAN(pred_fake, False).mean()
+        self.pred_real = self.netD(self.real_B,self.time_idx)
+        loss_D_real = self.criterionGAN(self.pred_real, True)
+        self.loss_D_real = loss_D_real.mean()
+
+        self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
+        return self.loss_D
+    def compute_E_loss(self):
+
+        bs =  self.real_A.size(0)
+
+        """Calculate energy loss for the energy network"""
+
+        # Check if entropy loss is needed (only compute E loss if using entropy)
+        use_entropy_loss = getattr(self.opt, 'use_entropy_loss', False)
+        if not use_entropy_loss and getattr(self.opt, 'lambda_SB', 0.0) > 0.0:
+            # If not using ablation flags, use default behavior (always compute E loss)
+            use_ot_input = getattr(self.opt, 'use_ot_input', False)
+            use_ot_output = getattr(self.opt, 'use_ot_output', False)
+            # If no ablation flags are set, we're in normal mode, so compute E loss
+            if not (use_ot_input or use_ot_output):
+                use_entropy_loss = True
+
+        if not use_entropy_loss:
+            # If E is not needed, return zero tensor
+            self.loss_E = torch.tensor(0.0, device=self.real_A.device, requires_grad=True)
+            return self.loss_E
+
+        XtXt_1 = torch.cat([self.real_A_noisy,self.fake_B.detach()], dim=1)
+        XtXt_2 = torch.cat([self.real_A_noisy2,self.fake_B2.detach()], dim=1)
+        temp = torch.logsumexp(self.netE(XtXt_1, self.time_idx, XtXt_2).reshape(-1), dim=0).mean()
+        self.loss_E = -self.netE(XtXt_1, self.time_idx, XtXt_1).mean() +temp + temp**2
+
+        return self.loss_E
+    def compute_G_loss(self):
+        bs =  self.real_A.size(0)
+        tau = self.opt.tau
+        
+        """Calculate GAN and NCE loss for the generator"""
+        fake = self.fake_B
+        std = torch.rand(size=[1]).item() * self.opt.std
+        
+        # GAN loss (can be disabled for ablation studies)
+        if self.opt.lambda_GAN > 0.0 and not getattr(self.opt, 'disable_gan', False):
+            pred_fake = self.netD(fake,self.time_idx)
+            self.loss_G_GAN = self.criterionGAN(pred_fake, True).mean() * self.opt.lambda_GAN
+        else:
+            self.loss_G_GAN = torch.tensor(0.0, device=self.real_A.device)
+
+        # Schrödinger Bridge loss with modular components
+        self.loss_SB = torch.tensor(0.0, device=self.real_A.device)
+        self.loss_SB_guidance = torch.tensor(0.0, device=self.real_A.device)  # For scheme A
+        self.loss_OT_input = torch.tensor(0.0, device=self.real_A.device)     # For ablation: real_A_noisy -> real_B (supervise intermediate state)
+        self.loss_OT_output = torch.tensor(0.0, device=self.real_A.device)    # For ablation: fake_B -> real_B (supervise final output)
+        self.loss_entropy = torch.tensor(0.0, device=self.real_A.device)      # For ablation: ET_XY term (energy regularization)
+
+        if self.opt.lambda_SB > 0.0:
+            # Check if using new ablation study parameters
+            use_ot_input = getattr(self.opt, 'use_ot_input', False)
+            use_ot_output = getattr(self.opt, 'use_ot_output', False)
+            use_entropy_loss = getattr(self.opt, 'use_entropy_loss', False)
+
+            # If any ablation flag is set, use new modular loss computation
+            if use_ot_input or use_ot_output or use_entropy_loss:
+                # Modular loss computation for ablation studies
+                if use_entropy_loss:
+                    XtXt_1 = torch.cat([self.real_A_noisy, self.fake_B], dim=1)
+                    XtXt_2 = torch.cat([self.real_A_noisy2, self.fake_B2], dim=1)
+                    ET_XY = self.netE(XtXt_1, self.time_idx, XtXt_1).mean() - torch.logsumexp(self.netE(XtXt_1, self.time_idx, XtXt_2).reshape(-1), dim=0)
+                    self.loss_entropy = -(self.opt.num_timesteps-self.time_idx[0])/self.opt.num_timesteps*self.opt.tau*ET_XY
+                    self.loss_SB += self.loss_entropy
+
+                if use_ot_input:
+                    # OT input loss: directly constrain noisy state to GT
+                    # real_A_noisy is computed with gradient in forward() when use_ot_input=True
+                    # This supervises the intermediate diffusion state directly
+                    self.loss_OT_input = self.opt.tau * torch.mean((self.real_A_noisy - self.real_B)**2)
+                    self.loss_SB += self.loss_OT_input
+
+                if use_ot_output:
+                    # OT output loss: push generated output toward GT
+                    self.loss_OT_output = self.opt.tau * torch.mean((self.fake_B - self.real_B)**2)
+                    self.loss_SB += self.loss_OT_output
+
+            else:
+                # Original SB loss computation (default behavior)
+                XtXt_1 = torch.cat([self.real_A_noisy, self.fake_B], dim=1)
+                XtXt_2 = torch.cat([self.real_A_noisy2, self.fake_B2], dim=1)
+
+                bs = self.opt.batch_size
+
+                ET_XY    = self.netE(XtXt_1, self.time_idx, XtXt_1).mean() - torch.logsumexp(self.netE(XtXt_1, self.time_idx, XtXt_2).reshape(-1), dim=0)
+                self.loss_SB = -(self.opt.num_timesteps-self.time_idx[0])/self.opt.num_timesteps*self.opt.tau*ET_XY
+                self.loss_SB += self.opt.tau*torch.mean((self.real_A_noisy-self.fake_B)**2)
+
+                # Scheme A: Use GT to guide transport in SB framework
+                paired_strategy = getattr(self.opt, 'paired_strategy', 'none')
+                if getattr(self.opt, 'paired_stage', False) and paired_strategy == 'sb_gt_transport':
+                    # Add GT guidance term in the form of transport cost
+                    # This guides fake_B toward real_B while maintaining SB's mathematical structure
+                    self.loss_SB_guidance = self.opt.tau * torch.mean((self.fake_B - self.real_B)**2)
+                    self.loss_SB += self.loss_SB_guidance
+        # NCE loss (can be disabled for ablation studies)
+        if self.opt.lambda_NCE > 0.0 and not getattr(self.opt, 'disable_nce', False):
+            self.loss_NCE = self.calculate_NCE_loss(self.real_A, fake)
+        else:
+            self.loss_NCE = torch.tensor(0.0, device=self.real_A.device)
+            self.loss_NCE_bd = torch.tensor(0.0, device=self.real_A.device)
+
+        if self.opt.nce_idt and self.opt.lambda_NCE > 0.0 and not getattr(self.opt, 'disable_nce', False):
+            self.loss_NCE_Y = self.calculate_NCE_loss(self.real_B, self.idt_B)
+            loss_NCE_both = (self.loss_NCE + self.loss_NCE_Y) * 0.5
+        else:
+            loss_NCE_both = self.loss_NCE
+
+        # Strategy-specific losses for paired training
+        paired_strategy = getattr(self.opt, 'paired_strategy', 'none')
+        extra_loss = torch.tensor(0.0, device=self.real_A.device)
+        lambda_reg = getattr(self.opt, 'lambda_reg', 1.0)  # Default weight for B1-B5
+
+        if getattr(self.opt, 'paired_stage', False):
+            if paired_strategy == 'sb_gt_transport':
+                # Scheme A: GT guidance already added to loss_SB above
+                pass
+
+            elif paired_strategy == 'l1_loss':
+                # Baseline: Simple L1 loss
+                self.loss_L1 = self.criterionL1(fake, self.real_B) * getattr(self.opt, 'lambda_L1', 1.0)
+                extra_loss += self.loss_L1
+
+            elif paired_strategy == 'nce_feature':
+                # B1: Enhanced NCE - pull fake_B and real_B features together
+                self.loss_NCE_paired = self.calculate_NCE_loss(self.real_B, fake) * lambda_reg
+                extra_loss += self.loss_NCE_paired
+
+            elif paired_strategy == 'frequency':
+                # B2: Frequency domain loss
+                self.loss_freq = self.compute_frequency_loss(fake, self.real_B) * lambda_reg
+                extra_loss += self.loss_freq
+
+            elif paired_strategy == 'gradient':
+                # B3: Gradient/structure loss
+                self.loss_gradient = self.compute_gradient_loss(fake, self.real_B) * lambda_reg
+                extra_loss += self.loss_gradient
+
+            elif paired_strategy == 'multiscale':
+                # B4: Multi-scale loss
+                self.loss_multiscale = self.compute_multiscale_loss(fake, self.real_B) * lambda_reg
+                extra_loss += self.loss_multiscale
+
+            elif paired_strategy == 'selfsup_contrast':
+                # B5: Self-supervised contrastive learning
+                self.loss_contrast = self.compute_contrastive_loss(fake, self.real_B) * lambda_reg
+                extra_loss += self.loss_contrast
+
+        self.loss_G = self.loss_G_GAN + self.opt.lambda_SB*self.loss_SB + self.opt.lambda_NCE*loss_NCE_both + extra_loss
+        return self.loss_G
+
+    def compute_frequency_loss(self, fake_B, real_B):
+        """B2: Frequency domain loss using FFT."""
+        # Convert to frequency domain
+        fake_fft = torch.fft.fft2(fake_B)
+        real_fft = torch.fft.fft2(real_B)
+
+        # Separate magnitude and phase
+        fake_mag = torch.abs(fake_fft)
+        real_mag = torch.abs(real_fft)
+
+        # L1 loss on magnitude spectrum
+        freq_loss = torch.mean(torch.abs(fake_mag - real_mag))
+
+        return freq_loss
+
+    def compute_gradient_loss(self, fake_B, real_B):
+        """B3: Gradient-based structure loss."""
+        # Compute gradients
+        def compute_gradients(img):
+            # Sobel-like gradient
+            grad_x = img[:, :, :, 1:] - img[:, :, :, :-1]
+            grad_y = img[:, :, 1:, :] - img[:, :, :-1, :]
+            return grad_x, grad_y
+
+        fake_grad_x, fake_grad_y = compute_gradients(fake_B)
+        real_grad_x, real_grad_y = compute_gradients(real_B)
+
+        # L1 loss on gradients
+        loss_x = torch.mean(torch.abs(fake_grad_x - real_grad_x))
+        loss_y = torch.mean(torch.abs(fake_grad_y - real_grad_y))
+
+        return loss_x + loss_y
+
+    def compute_multiscale_loss(self, fake_B, real_B):
+        """B4: Multi-scale pyramid loss."""
+        def build_pyramid(img, levels=3):
+            pyramid = [img]
+            for _ in range(levels - 1):
+                img = torch.nn.functional.avg_pool2d(img, kernel_size=2, stride=2)
+                pyramid.append(img)
+            return pyramid
+
+        fake_pyramid = build_pyramid(fake_B)
+        real_pyramid = build_pyramid(real_B)
+
+        # Weighted loss at each scale
+        total_loss = 0.0
+        weights = [1.0, 0.5, 0.25]  # Coarse to fine
+        for i, (f, r, w) in enumerate(zip(fake_pyramid, real_pyramid, weights)):
+            total_loss += w * torch.mean(torch.abs(f - r))
+
+        return total_loss / sum(weights)
+
+    def compute_contrastive_loss(self, fake_B, real_B):
+        """B5: Self-supervised contrastive learning using netF features."""
+        # Extract features using the existing netF network
+        z = torch.randn(size=[self.real_A.size(0), 4*self.opt.ngf]).to(self.real_A.device)
+
+        # Get features from fake_B and real_B
+        feat_fake = self.netG(fake_B, self.time_idx*0, z, self.nce_layers, encode_only=True)
+        feat_real = self.netG(self.real_B, self.time_idx*0, z, self.nce_layers, encode_only=True)
+
+        # Pool features
+        feat_fake_pool, sample_ids = self.netF(feat_fake, self.opt.num_patches, None)
+        feat_real_pool, _ = self.netF(feat_real, self.opt.num_patches, sample_ids)
+
+        # Contrastive loss: pull positive pairs together
+        total_contrast_loss = 0.0
+        for f_fake, f_real in zip(feat_fake_pool, feat_real_pool):
+            # Cosine similarity
+            f_fake_norm = f_fake / (f_fake.norm(dim=1, keepdim=True) + 1e-8)
+            f_real_norm = f_real / (f_real.norm(dim=1, keepdim=True) + 1e-8)
+
+            # Pull together (maximize similarity)
+            similarity = (f_fake_norm * f_real_norm).sum(dim=1).mean()
+            total_contrast_loss += (1.0 - similarity)
+
+        return total_contrast_loss / len(feat_fake_pool)
+
+
+    def calculate_NCE_loss(self, src, tgt):
+        n_layers = len(self.nce_layers)
+        z    = torch.randn(size=[self.real_A.size(0),4*self.opt.ngf]).to(self.real_A.device)
+        feat_q = self.netG(tgt, self.time_idx*0, z, self.nce_layers, encode_only=True)
+
+        if self.opt.flip_equivariance and self.flipped_for_equivariance:
+            feat_q = [torch.flip(fq, [3]) for fq in feat_q]
+        
+        feat_k = self.netG(src, self.time_idx*0,z,self.nce_layers, encode_only=True)
+        feat_k_pool, sample_ids = self.netF(feat_k, self.opt.num_patches, None)
+        feat_q_pool, _ = self.netF(feat_q, self.opt.num_patches, sample_ids)
+
+        total_nce_loss = 0.0
+        for f_q, f_k, crit, nce_layer in zip(feat_q_pool, feat_k_pool, self.criterionNCE, self.nce_layers):
+            loss = crit(f_q, f_k) * self.opt.lambda_NCE
+            total_nce_loss += loss.mean()
+
+        return total_nce_loss / n_layers
+
+    def compute_paired_metrics(self):
+        """Compute SSIM, PSNR, and NRMSE metrics between fake_B and real_B.
+
+        Only call this when paired_stage is enabled and we have ground truth.
+
+        Returns:
+            dict with keys 'ssim', 'psnr', 'nrmse', each containing the mean value across the batch
+        """
+        from skimage.metrics import structural_similarity as ssim
+        from skimage.metrics import peak_signal_noise_ratio as psnr
+        from skimage.metrics import normalized_root_mse as nrmse
+
+        if not hasattr(self, 'fake_B') or not hasattr(self, 'real_B'):
+            return {'ssim': 0.0, 'psnr': 0.0, 'nrmse': 0.0}
+
+        def tensor_to_numpy(tensor):
+            """Convert tensor to numpy array for metric computation."""
+            if isinstance(tensor, torch.Tensor):
+                img = tensor.detach().cpu().float().numpy()
+            else:
+                img = np.array(tensor)
+
+            # Handle different channel configurations
+            if img.ndim == 4:  # Batch dimension
+                return img
+            elif img.ndim == 3:
+                if img.shape[0] == 1:  # Single channel [1, H, W]
+                    img = img[0]
+                elif img.shape[0] == 2:  # Complex data [2, H, W] - convert to magnitude
+                    real, imag = img[0], img[1]
+                    img = np.sqrt(real * real + imag * imag)
+                else:  # Multi-channel
+                    img = img[0]  # Take first channel
+
+            return img
+
+        fake_B_np = tensor_to_numpy(self.fake_B)  # [B, C, H, W] or [B, H, W]
+        real_B_np = tensor_to_numpy(self.real_B)  # [B, C, H, W] or [B, H, W]
+
+        batch_size = fake_B_np.shape[0] if fake_B_np.ndim == 4 else 1
+
+        ssim_vals = []
+        psnr_vals = []
+        nrmse_vals = []
+
+        for i in range(batch_size):
+            # Extract single image from batch
+            if fake_B_np.ndim == 4:
+                fake_img = fake_B_np[i]
+                real_img = real_B_np[i]
+            else:
+                fake_img = fake_B_np
+                real_img = real_B_np
+
+            # Handle channel dimension
+            if fake_img.ndim == 3:
+                if fake_img.shape[0] == 1:  # [1, H, W]
+                    fake_img = fake_img[0]
+                    real_img = real_img[0]
+                elif fake_img.shape[0] == 2:  # Complex [2, H, W]
+                    fake_img = np.sqrt(fake_img[0]**2 + fake_img[1]**2)
+                    real_img = np.sqrt(real_img[0]**2 + real_img[1]**2)
+
+            # Compute data range
+            data_range = real_img.max() - real_img.min()
+            if data_range == 0:
+                data_range = 1.0
+
+            try:
+                ssim_val = ssim(real_img, fake_img, data_range=data_range)
+                psnr_val = psnr(real_img, fake_img, data_range=data_range)
+                nrmse_val = nrmse(real_img, fake_img, normalization='mean')
+
+                ssim_vals.append(float(ssim_val))
+                psnr_vals.append(float(psnr_val))
+                nrmse_vals.append(float(nrmse_val))
+            except Exception as e:
+                # If metric computation fails, use default values
+                print(f"Warning: Failed to compute metrics: {e}")
+                ssim_vals.append(0.0)
+                psnr_vals.append(0.0)
+                nrmse_vals.append(1.0)
+
+        return {
+            'ssim': float(np.mean(ssim_vals)),
+            'psnr': float(np.mean(psnr_vals)),
+            'nrmse': float(np.mean(nrmse_vals))
+        }
