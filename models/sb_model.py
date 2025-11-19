@@ -99,7 +99,7 @@ class SBModel(BaseModel):
                 self.visual_names.append(fake_name)
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
 
-        if opt.nce_idt and self.isTrain:
+        if opt.nce_idt and self.isTrain and not getattr(opt, 'disable_nce', False):
             self.loss_names += ['NCE_Y']
             self.visual_names += ['idt_B']
 
